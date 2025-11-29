@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="BCIspeech" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="BCI-transformer" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="BCIspeech" project-jdk-type="Python SDK" />
 </project>

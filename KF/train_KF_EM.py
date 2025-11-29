@@ -1,0 +1,351 @@
+# ===========================================================
+# train_KF_EM.py
+# Kalman Filter + Iterative LDS refinement (simplified EM)
+# ===========================================================
+
+import torch
+import numpy as np
+import tensorflow as tf
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+
+from preprocess_kf import KalmanPreprocessor
+from ID2phoneme import id2phoneme
+import editdistance
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ===========================================================
+#  Dataset
+# ===========================================================
+class SpikeDataset(Dataset):
+    def __init__(self, tfrecord_paths, max_len=500):
+        self.paths = tfrecord_paths
+        self.max_len = max_len
+        self.raw = tf.data.TFRecordDataset(tfrecord_paths)
+        self.feature_desc = {
+            "inputFeatures": tf.io.FixedLenSequenceFeature([256], tf.float32, allow_missing=True),
+            "seqClassIDs": tf.io.FixedLenFeature((max_len,), tf.int64),
+            "nSeqElements": tf.io.FixedLenFeature((), tf.int64),
+            "nTimeSteps": tf.io.FixedLenFeature((), tf.int64),
+        }
+        self.samples = list(self.raw)
+        self._compute_stats()
+
+    def _compute_stats(self):
+        allX = []
+        for ex in self.samples:
+            e = tf.io.parse_single_example(ex, self.feature_desc)
+            allX.append(e["inputFeatures"].numpy())
+        Xcat = np.concatenate(allX, axis=0)
+        self.mean = Xcat.mean(axis=0)
+        self.std = Xcat.std(axis=0) + 1e-5
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        e = tf.io.parse_single_example(self.samples[idx], self.feature_desc)
+        X = e["inputFeatures"].numpy().astype(np.float32)
+        y = e["seqClassIDs"].numpy().reshape(-1).astype(int)
+        L = int(e["nSeqElements"].numpy())
+        T = int(e["nTimeSteps"].numpy())
+        y = y[:L]
+        return X, y, T, L, self.mean, self.std
+
+
+# ===========================================================
+# 1. Fit LDS with iterative refinement (simplified EM)
+# ===========================================================
+def fit_lds_iterative(Xs, latent_dim=30, n_iter=3):
+    """
+    Fit LDS parameters with iterative refinement.
+    Simpler than full EM, more numerically stable.
+    """
+    allX = np.concatenate(Xs, axis=0)
+    
+    print("Running PCA for initialization...")
+    allX_centered = allX - allX.mean(0, keepdims=True)
+    U, S, Vt = np.linalg.svd(allX_centered, full_matrices=False)
+    
+    C = Vt[:latent_dim].T  # (D, K)
+    pinvC = np.linalg.pinv(C)
+    
+    # Project to latent
+    X_latents = [X @ pinvC.T for X in Xs]
+    
+    # Iteratively refine A
+    print(f"Iterative refinement ({n_iter} iterations)...")
+    K = latent_dim
+    A = np.eye(K) * 0.95  # Start with stable dynamics
+    
+    for iteration in range(n_iter):
+        print(f"  Iteration {iteration + 1}/{n_iter}")
+        
+        # Re-estimate A from current latents
+        A_num = np.zeros((K, K))
+        A_den = np.zeros((K, K))
+        
+        for Z in X_latents:
+            if len(Z) < 2:
+                continue
+            Zt = Z[:-1]
+            Zt1 = Z[1:]
+            A_num += Zt1.T @ Zt
+            A_den += Zt.T @ Zt
+        
+        A_new = A_num @ np.linalg.pinv(A_den + np.eye(K) * 1e-6)
+        
+        # Stabilize A (ensure eigenvalues < 1)
+        eigvals = np.abs(np.linalg.eigvals(A_new))
+        max_eig = np.max(eigvals)
+        if max_eig > 0.99:
+            A_new = A_new * (0.99 / max_eig)
+        
+        A = A_new
+        
+        # Re-project with smoothing (simple version)
+        X_latents_new = []
+        for X in Xs:
+            Z = X @ pinvC.T
+            # Simple temporal smoothing
+            Z_smooth = np.zeros_like(Z)
+            Z_smooth[0] = Z[0]
+            for t in range(1, len(Z)):
+                Z_smooth[t] = 0.3 * A @ Z_smooth[t-1] + 0.7 * Z[t]
+            X_latents_new.append(Z_smooth)
+        X_latents = X_latents_new
+    
+    # Final Q estimation
+    print("Estimating Q...")
+    Qs = []
+    for Z in X_latents:
+        if len(Z) < 2:
+            continue
+        err = Z[1:] - Z[:-1] @ A.T
+        Qs.append(np.mean(err ** 2, axis=0))
+    Q = np.diag(np.mean(Qs, axis=0) + 1e-6)
+    
+    # R estimation (diagonal)
+    print("Estimating R...")
+    R_diag = np.ones(allX.shape[1]) * 0.1
+    
+    return A, C, Q, R_diag, X_latents
+
+
+# ===========================================================
+# 2. Simple Kalman Filter for decoding
+# ===========================================================
+def kalman_filter(Y, A, C, Q, R_diag):
+    """Simple forward Kalman filter."""
+    T, D = Y.shape
+    K = A.shape[0]
+    
+    x = np.zeros(K)
+    P = np.eye(K)
+    out = np.zeros((T, K))
+    
+    pinvC = np.linalg.pinv(C)
+    
+    for t in range(T):
+        # Predict
+        x_pred = A @ x
+        P_pred = A @ P @ A.T + Q
+        
+        # Simple update (use projection + blend)
+        z_obs = Y[t] @ pinvC.T
+        x = 0.5 * x_pred + 0.5 * z_obs
+        P = P_pred * 0.9
+        
+        out[t] = x
+    
+    return out
+
+
+# ===========================================================
+# 3. Classifier and utilities
+# ===========================================================
+def create_frame_labels(T_frames, phoneme_seq):
+    L = len(phoneme_seq)
+    if L == 0:
+        return np.zeros(T_frames, dtype=int)
+    frame_labels = np.zeros(T_frames, dtype=int)
+    frames_per_phoneme = T_frames / L
+    for i in range(T_frames):
+        phoneme_idx = min(int(i / frames_per_phoneme), L - 1)
+        frame_labels[i] = phoneme_seq[phoneme_idx]
+    return frame_labels
+
+
+from sklearn.linear_model import LogisticRegression
+
+def train_classifier(latent_list, label_list):
+    X_all = []
+    y_all = []
+    for Z, y in zip(latent_list, label_list):
+        T_frames = len(Z)
+        y = np.asarray(y).reshape(-1).astype(int)
+        frame_labels = create_frame_labels(T_frames, y)
+        X_all.append(Z)
+        y_all.append(frame_labels)
+    X_all = np.concatenate(X_all, axis=0)
+    y_all = np.concatenate(y_all, axis=0)
+    print(f"Training classifier on {len(X_all)} frames...")
+    clf = LogisticRegression(max_iter=500, class_weight='balanced', n_jobs=-1)
+    clf.fit(X_all, y_all)
+    return clf
+
+
+from scipy.stats import mode
+
+def smooth_predictions(pred, window_size=7):
+    T = len(pred)
+    smoothed = np.zeros(T, dtype=int)
+    half_w = window_size // 2
+    for i in range(T):
+        start = max(0, i - half_w)
+        end = min(T, i + half_w + 1)
+        window = pred[start:end]
+        smoothed[i] = mode(window, keepdims=False)[0]
+    return smoothed
+
+
+def remove_short_segments(pred, min_len=5):
+    result = pred.copy()
+    T = len(pred)
+    i = 0
+    while i < T:
+        j = i
+        while j < T and pred[j] == pred[i]:
+            j += 1
+        seg_len = j - i
+        if seg_len < min_len:
+            if i > 0:
+                result[i:j] = result[i-1]
+            elif j < T:
+                result[i:j] = pred[j]
+        i = j
+    return result
+
+
+def decode_sequence(Y, A, C, Q, R_diag, clf, smooth=True):
+    Z = kalman_filter(Y, A, C, Q, R_diag)
+    pred = clf.predict(Z)
+    if smooth:
+        pred = smooth_predictions(pred, window_size=7)
+        pred = remove_short_segments(pred, min_len=5)
+    return pred
+
+
+def collapse_repeats(seq):
+    if len(seq) == 0:
+        return []
+    result = [seq[0]]
+    for i in range(1, len(seq)):
+        if seq[i] != result[-1]:
+            result.append(seq[i])
+    return result
+
+
+# ===========================================================
+# 4. Evaluation
+# ===========================================================
+def evaluate_kf(test_loader, preproc, A, C, Q, R_diag, clf, num_samples=20):
+    total_pref_frame = 0
+    total_edit_seq = 0
+    count = 0
+
+    print(f"Evaluating {num_samples} samples...")
+
+    for i, (X, y, T, L, mean, std) in enumerate(test_loader):
+        if count >= num_samples:
+            break
+        Xi = X[0, :T].numpy()
+        yi = y.numpy().reshape(-1).astype(int)
+        L_val = int(L.numpy())
+        yi = yi[:L_val]
+        Xi, _ = preproc(Xi, mean.numpy(), std.numpy())
+        pred_frames = decode_sequence(Xi, A, C, Q, R_diag, clf)
+        yi_frames = create_frame_labels(len(pred_frames), yi)
+        pref_frame = np.mean(pred_frames == yi_frames)
+        pred_seq = collapse_repeats(pred_frames.tolist())
+        edit_seq = editdistance.eval(pred_seq, yi.tolist()) / max(len(yi), 1)
+        total_pref_frame += pref_frame
+        total_edit_seq += edit_seq
+        count += 1
+
+    return total_pref_frame / count, total_edit_seq / count
+
+
+def show_one(test_loader, preproc, A, C, Q, R_diag, clf):
+    X, y, T, L, mean, std = next(iter(test_loader))
+    Xi = X[0, :T].numpy()
+    yi = y.numpy().reshape(-1).astype(int)
+    L_val = int(L.numpy())
+    yi = yi[:L_val]
+    Xi, _ = preproc(Xi, mean.numpy(), std.numpy())
+    pred_frames = decode_sequence(Xi, A, C, Q, R_diag, clf)
+    pred_seq = collapse_repeats(pred_frames.tolist())
+
+    print("\n===== KF+Iterative Sample Decode =====")
+    print(f"Frame predictions (first 50): {pred_frames[:50].tolist()}")
+    print(f"Pred Seq ({len(pred_seq)}): {pred_seq[:30]}...")
+    print(f"True Seq ({len(yi)}): {yi.tolist()[:30]}...")
+    print(f"Pred PH: {[id2phoneme.get(p, '?') for p in pred_seq[:20]]}...")
+    print(f"True PH: {[id2phoneme.get(p, '?') for p in yi[:20]]}...")
+    print(f"Edit distance: {editdistance.eval(pred_seq, yi.tolist())}")
+    print("======================================\n")
+
+
+# ===========================================================
+# 5. Main
+# ===========================================================
+def train_kf_em():
+    BASE = r"D:\DeepLearning\BCI\Dataset\derived\tfRecords"
+    DATES = [
+        "t12.2022.04.28", "t12.2022.05.05", "t12.2022.05.17",
+        "t12.2022.05.19", "t12.2022.05.24", "t12.2022.05.26",
+        "t12.2022.06.02", "t12.2022.06.07", "t12.2022.06.14",
+        "t12.2022.06.16", "t12.2022.06.21", "t12.2022.06.23",
+        "t12.2022.06.28", "t12.2022.07.05", "t12.2022.07.14",
+        "t12.2022.07.21", "t12.2022.07.27", "t12.2022.07.29"
+    ]
+
+    train_paths = [f"{BASE}/{d}/train/chunk_0.tfrecord" for d in DATES]
+    test_paths = [f"{BASE}/{d}/test/chunk_0.tfrecord" for d in DATES]
+
+    train_ds = SpikeDataset(train_paths)
+    test_ds = SpikeDataset(test_paths)
+
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=True)
+
+    preproc = KalmanPreprocessor(sigma=1.5)
+
+    print("Loading & preprocessing training data...")
+    Xs = []
+    Ys = []
+    for X, y, T, L, mean, std in tqdm(train_loader):
+        Xi = X[0, :T].numpy()
+        yi = y.numpy().reshape(-1).astype(int)
+        Xi, _ = preproc(Xi, mean.numpy(), std.numpy())
+        Xs.append(Xi)
+        Ys.append(yi)
+
+    print("\nFitting LDS with iterative refinement...")
+    A, C, Q, R_diag, latents = fit_lds_iterative(Xs, latent_dim=30, n_iter=3)
+
+    print("\nTraining classifier...")
+    clf = train_classifier(latents, Ys)
+
+    frame_acc, seq_per = evaluate_kf(test_loader, preproc, A, C, Q, R_diag, clf, num_samples=20)
+    print(f"\nKF+Iterative Results:")
+    print(f"  Frame-level Accuracy: {frame_acc:.3f}")
+    print(f"  Sequence PER (after collapse): {seq_per:.3f}")
+
+    show_one(test_loader, preproc, A, C, Q, R_diag, clf)
+
+
+if __name__ == "__main__":
+    train_kf_em()

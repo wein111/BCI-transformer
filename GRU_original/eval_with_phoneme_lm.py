@@ -493,13 +493,15 @@ def main():
     print("Device:", DEVICE)
 
     # ===== 路径（按你训练时的来，自己切换本地 / Colab） =====
-    # 本地 Mac 版本（如果你有本地数据）:
-    # BASE = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/Dataset/derived/tfRecords"
-    # MODEL_PATH = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/GRU_original/best_model.pt"
+    # 本地  版本（如果你有本地数据）:
+    #BASE = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/Dataset/derived/tfRecords"
+    BASE = r"D:\DeepLearning\BCI\Dataset\derived\tfRecords"
+    MODEL_PATH = r"D:\DeepLearning\BCI\GRU_original\best_model.pt"
 
     # Colab 版本：
-    BASE = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/Dataset/derived/tfRecords"
-    MODEL_PATH = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/GRU_original/best_model.pt"
+    #BASE = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/Dataset/derived/tfRecords"
+    #MODEL_PATH = "/Users/wei/Courses/EE675/SpeechBCI-Transformer/BCI-transformer/GRU_original/best_model.pt"
+
 
     DATES = [
         "t12.2022.04.28", "t12.2022.05.05", "t12.2022.05.17",
@@ -546,14 +548,14 @@ def main():
     # ====== Evaluate ======
     print("\n==== TRAIN SET ====")
     (gp_tr, ge_tr), (lp_tr, le_tr) = evaluate(
-        model, train_loader, preproc, decoder_lm=lm, max_batches=300
+        model, train_loader, preproc, decoder_lm=lm, max_batches=100
     )
     print(f"Greedy pref={gp_tr:.3f}, PER={ge_tr:.3f}")
     print(f"Beam+LM pref={lp_tr:.3f}, PER={le_tr:.3f}")
 
     print("\n==== TEST SET ====")
     (gp_te, ge_te), (lp_te, le_te) = evaluate(
-        model, test_loader, preproc, decoder_lm=lm, max_batches=300
+        model, test_loader, preproc, decoder_lm=lm, max_batches=100
     )
     print(f"Greedy pref={gp_te:.3f}, PER={ge_te:.3f}")
     print(f"Beam+LM pref={lp_te:.3f}, PER={le_te:.3f}")
